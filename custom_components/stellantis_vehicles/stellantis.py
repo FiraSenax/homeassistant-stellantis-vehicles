@@ -876,7 +876,7 @@ class StellantisVehicles(StellantisOauth):
 
     @log_call
     async def scheduled_mqtt_token_refresh(self, now=None, force=False):
-        if not self.remote_commands:
+        if self._shutting_down or not self.remote_commands:
             return
         def get_next_run():
             mqtt_config = self.get_config("mqtt")
@@ -926,6 +926,8 @@ class StellantisVehicles(StellantisOauth):
             # inside the try and is only re-armed below.
             _LOGGER.exception("Unexpected error during the MQTT token refresh, retrying in 5 minutes")
             next_run = get_datetime() + timedelta(minutes=5)
+        if self._shutting_down:
+            return
         _LOGGER.debug("Next mqtt token refresh scheduled for %s", next_run)
         next_job = HassJob(self.scheduled_mqtt_token_refresh, f"{DOMAIN} refresh mqtt token: {next_run}", cancel_on_shutdown=True)
         self._mqtt_token_scheduled = async_track_point_in_time(self._hass, next_job, next_run)

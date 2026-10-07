@@ -201,3 +201,34 @@ async def test_cancelled_flow_closes_owned_session():
     await asyncio.gather(*tasks)
     client.close_session.assert_awaited_once()
     assert flow.stellantis is None
+
+
+@pytest.mark.asyncio
+async def test_combined_build_concurrent_refresh_exchanges_token_once():
+    client = stellantis.StellantisVehicles(Mock())
+    client.save_config({'oauth': {'access_token':'old', 'refresh_token':'old-refresh'}})
+    client.apply_query_params = Mock(return_value='https://example.invalid/token')
+    client.apply_dict_params = Mock(return_value={})
+    client.update_stored_config = Mock()
+    async def exchange(*args):
+        await asyncio.sleep(0)
+        return {'access_token':'new', 'refresh_token':'new-refresh', 'expires_in':3600}
+    client.make_http_request = AsyncMock(side_effect=exchange)
+    await asyncio.gather(client.refresh_oauth_token_request(), client.refresh_oauth_token_request())
+    client.make_http_request.assert_awaited_once()
+    assert client.get_config('oauth')['refresh_token'] == 'new-refresh'
+
+
+@pytest.mark.asyncio
+async def test_combined_build_rate_limits_do_not_cross_accounts():
+    from custom_components.stellantis_vehicles.utils import rate_limit
+    from custom_components.stellantis_vehicles.exceptions import RateLimitException
+    class Account:
+        @rate_limit(1,1800)
+        async def request(self):
+            return True
+    first,second = Account(),Account()
+    assert await first.request()
+    assert await second.request()
+    with pytest.raises(RateLimitException):
+        await first.request()
