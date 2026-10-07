@@ -201,3 +201,64 @@ async def test_cancelled_flow_closes_owned_session():
     await asyncio.gather(*tasks)
     client.close_session.assert_awaited_once()
     assert flow.stellantis is None
+
+
+@pytest.mark.asyncio
+async def test_omitted_url_reuses_saved_local_worker_on_failure():
+    flow = config_flow.StellantisVehiclesConfigFlow()
+    flow.data = {FIELD_OAUTH_CODE_URL: 'http://local-worker:3000'}
+    flow.stellantis = Mock(get_oauth_code=AsyncMock(side_effect=CommunicationError('offline')))
+    flow.get_error_message = Mock(return_value='get_oauth_code')
+    flow.async_show_form = Mock(side_effect=lambda **kwargs: kwargs)
+    result = await flow.async_step_oauth_remote({'email': 'fake', 'password': 'fake-secret'})
+    flow.stellantis.get_oauth_code.assert_awaited_once_with('fake', 'fake-secret', 'http://local-worker:3000')
+    assert result['step_id'] == 'oauth_remote'
+    assert flow.data == {FIELD_OAUTH_CODE_URL: 'http://local-worker:3000'}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('url', ['', 'file:///tmp/worker', 'http://', 'http://user:secret@worker',
+                                  'http://worker:wrong', 'https://worker/#secret', 'http://work er'])
+async def test_invalid_worker_never_receives_credentials(url):
+    flow = config_flow.StellantisVehiclesConfigFlow()
+    flow.stellantis = Mock(get_oauth_code=AsyncMock())
+    flow.async_show_form = Mock(side_effect=lambda **kwargs: kwargs)
+    result = await flow.async_step_oauth_remote({'email': 'fake', 'password': 'fake-secret', FIELD_OAUTH_CODE_URL: url})
+    assert result['errors'] == {FIELD_OAUTH_CODE_URL: 'invalid_login_service_url'}
+    flow.stellantis.get_oauth_code.assert_not_awaited()
+    assert 'password' not in flow.data
+
+
+@pytest.mark.asyncio
+async def test_save_worker_preference_without_authentication_or_stale_tokens():
+    flow = config_flow.StellantisVehiclesConfigFlow()
+    flow._copy_account_settings(account())
+    flow.context = {'source': 'reconfigure'}
+    entry = SimpleNamespace(data={**account(), 'oauth': {'access_token':'fresh'}},
+                            unique_id='fake-customer_MyPeugeot_DE')
+    flow._get_reconfigure_entry = Mock(return_value=entry)
+    flow.async_update_reload_and_abort = Mock(return_value={'type':'abort'})
+    flow.stellantis = Mock(close_session=AsyncMock(), get_oauth_code=AsyncMock())
+    result = await flow.async_step_options({FIELD_NOTIFICATIONS:False, FIELD_ANONYMIZE_LOGS:True,
+                                          FIELD_OAUTH_CODE_URL:' http://local-addon:3000/ '})
+    assert result['type'] == 'abort'
+    updates = flow.async_update_reload_and_abort.call_args.kwargs['data_updates']
+    assert updates[FIELD_OAUTH_CODE_URL] == 'http://local-addon:3000/'
+    assert not {'oauth','mqtt','password','vehicles'} & updates.keys()
+    flow.stellantis.get_oauth_code.assert_not_awaited()
+    reopened = config_flow.StellantisVehiclesConfigFlow()
+    reopened.async_step_reauth_confirm = AsyncMock()
+    await reopened.async_step_reauth({**entry.data, **updates})
+    assert reopened.data[FIELD_OAUTH_CODE_URL] == 'http://local-addon:3000/'
+
+
+@pytest.mark.asyncio
+async def test_invalid_settings_do_not_save_or_start_login():
+    flow = config_flow.StellantisVehiclesConfigFlow()
+    flow._copy_account_settings(account())
+    flow.async_step_final = AsyncMock()
+    flow.async_show_form = Mock(side_effect=lambda **kwargs: kwargs)
+    result = await flow.async_step_options({FIELD_OAUTH_CODE_URL:'not-a-url'})
+    assert result['errors'] == {FIELD_OAUTH_CODE_URL:'invalid_login_service_url'}
+    flow.async_step_final.assert_not_awaited()
+    assert flow.data[FIELD_OAUTH_CODE_URL] == account()[FIELD_OAUTH_CODE_URL]

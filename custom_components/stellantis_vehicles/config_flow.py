@@ -3,6 +3,7 @@ from copy import deepcopy
 import voluptuous as vol
 from datetime import timedelta
 from uuid import uuid4
+from urllib.parse import urlsplit
 
 from homeassistant.config_entries import ( ConfigFlow, SOURCE_REAUTH, SOURCE_RECONFIGURE )
 from homeassistant.core import callback
@@ -61,6 +62,22 @@ def OAUTH_REMOTE_SCHEMA(default_oauth_code_url=None):
         vol.Optional(FIELD_OAUTH_CODE_URL, default=default_oauth_code_url or OAUTH_CODE_URL): str
     })
 
+def login_service_url(value):
+    """Validate an explicitly selected endpoint before sending credentials."""
+    if not isinstance(value, str):
+        raise ValueError("Invalid login service URL")
+    value = value.strip()
+    parts = urlsplit(value)
+    # Accessing .port also rejects malformed/non-numeric ports.
+    port = parts.port
+    if (parts.scheme not in ("http", "https") or not parts.hostname
+            or parts.username is not None or parts.password is not None
+            or parts.fragment or any(char.isspace() for char in value)
+            or (port is not None and port == 0)):
+        raise ValueError("Invalid login service URL")
+    return value
+
+
 def OTP_CONFIGURE_SCHEMA(default_remote_commands=False):
     return vol.Schema({
         vol.Required(FIELD_REMOTE_COMMANDS, default=default_remote_commands): bool
@@ -74,13 +91,15 @@ OTP_SCHEMA = vol.Schema({
 def OPTIONS_SCHEMA(reconfig=None):
     defaults = {
         FIELD_NOTIFICATIONS: True,
-        FIELD_ANONYMIZE_LOGS: True
+        FIELD_ANONYMIZE_LOGS: True,
+        FIELD_OAUTH_CODE_URL: OAUTH_CODE_URL
     }
     if reconfig:
         defaults.update(reconfig)
     return vol.Schema({
         vol.Required(FIELD_NOTIFICATIONS, default=defaults[FIELD_NOTIFICATIONS]): bool,
-        vol.Required(FIELD_ANONYMIZE_LOGS, default=defaults[FIELD_ANONYMIZE_LOGS]): bool
+        vol.Required(FIELD_ANONYMIZE_LOGS, default=defaults[FIELD_ANONYMIZE_LOGS]): bool,
+        vol.Optional(FIELD_OAUTH_CODE_URL, default=defaults[FIELD_OAUTH_CODE_URL]): str
     })
 
 RECONFIGURE_SCHEMA = vol.Schema({
@@ -164,17 +183,24 @@ class StellantisVehiclesConfigFlow(ConfigFlow, domain=DOMAIN):
             errors, self.errors = self.errors, {}
             return self.async_show_form(step_id="oauth_remote", data_schema=OAUTH_REMOTE_SCHEMA(self.data.get(FIELD_OAUTH_CODE_URL)), description_placeholders=TRANSLATION_PLACEHOLDERS, errors=errors)
 
-        # Remember the selected local worker even when its first attempt fails.
-        # Passwords are only passed to the request and never retained here.
-        self.data[FIELD_OAUTH_CODE_URL] = user_input.get(FIELD_OAUTH_CODE_URL, OAUTH_CODE_URL)
         try:
-            code_request = await self.stellantis.get_oauth_code(user_input[CONF_EMAIL], user_input[CONF_PASSWORD], user_input.get(FIELD_OAUTH_CODE_URL, OAUTH_CODE_URL))
+            endpoint = login_service_url(user_input.get(
+                FIELD_OAUTH_CODE_URL, self.data.get(FIELD_OAUTH_CODE_URL, OAUTH_CODE_URL)))
+        except ValueError:
+            self.errors[FIELD_OAUTH_CODE_URL] = "invalid_login_service_url"
+            return await self.async_step_oauth_remote()
+
+        # Keep retries on the selected service. Never fail over with credentials
+        # to the public service when a self-hosted worker is unavailable.
+        self.data[FIELD_OAUTH_CODE_URL] = endpoint
+        try:
+            code_request = await self.stellantis.get_oauth_code(
+                user_input[CONF_EMAIL], user_input[CONF_PASSWORD], endpoint)
         except Exception as e:
             message = self.get_error_message("get_oauth_code", e)
             self.errors["base"] = message
             return await self.async_step_oauth_remote()
 
-        self.data.update({FIELD_OAUTH_CODE_URL: user_input.get(FIELD_OAUTH_CODE_URL, OAUTH_CODE_URL)})
         self.stellantis.save_config({"oauth_code": code_request["code"]})
         return await self.async_step_get_access_token()
 
@@ -297,11 +323,19 @@ class StellantisVehiclesConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
     async def async_step_options(self, user_input=None):
-        if user_input is None:
-            return self.async_show_form(step_id="options", data_schema=OPTIONS_SCHEMA(self.data))
+        errors = {}
+        if user_input is not None:
+            try:
+                endpoint = login_service_url(user_input.get(
+                    FIELD_OAUTH_CODE_URL, self.data.get(FIELD_OAUTH_CODE_URL, OAUTH_CODE_URL)))
+            except ValueError:
+                errors[FIELD_OAUTH_CODE_URL] = "invalid_login_service_url"
+            else:
+                self.data.update(user_input)
+                self.data[FIELD_OAUTH_CODE_URL] = endpoint
+                return await self.async_step_final()
 
-        self.data.update(user_input)
-        return await self.async_step_final()
+        return self.async_show_form(step_id="options", data_schema=OPTIONS_SCHEMA(self.data), errors=errors)
 
 
     async def async_step_final(self, user_input=None):
