@@ -724,13 +724,15 @@ class StellantisVehicles(StellantisOauth):
     @log_call
     @rate_limit(6, 1800) # 6 per 30 min
     async def refresh_oauth_token_request(self) -> None:
+        # save_config() below rotates this out of the masked set before it
+        # appears in the exchange log's request URL - register it separately.
+        self.logger_filter.add_custom_value((self.get_config("oauth") or {}).get("refresh_token"))
+        # Keep these checks next to the request: a queued refresh must observe
+        # shutdown or a credential rejection from the preceding refresh.
         if self._shutting_down:
             raise CommunicationError("Integration is shutting down")
         if self._oauth_auth_failed:
             raise ConfigEntryAuthFailed("OAuth credentials rejected; reauthentication required")
-        # save_config() below rotates this out of the masked set before it
-        # appears in the exchange log's request URL - register it separately.
-        self.logger_filter.add_custom_value((self.get_config("oauth") or {}).get("refresh_token"))
         url = self.apply_query_params(OAUTH_TOKEN_URL, OAUTH_REFRESH_TOKEN_QUERY_PARAMS)
         headers = self.apply_dict_params(OAUTH_TOKEN_HEADERS)
         try:
